@@ -1,0 +1,232 @@
+# ---------------------------------------------------------------------------
+# AI lab stack - Ollama, Open WebUI, Qdrant, Langfuse, Prometheus, Grafana
+#
+# Default layout assumes Ollama runs NATIVELY on Windows (recommended for
+# Maxwell-era cards, see README) and everything else runs in containers.
+#
+#   docker compose up -d
+#
+# To run Ollama in a container instead (Linux hosts, or WSL2 if CUDA
+# passthrough works for you):
+#
+#   docker compose --profile ollama-container up -d
+#
+# Optional extras:
+#   --profile metrics    Prometheus + Grafana + GPU exporter
+#   --profile pgvector   Postgres with pgvector, as a Qdrant alternative
+# ---------------------------------------------------------------------------
+
+name: ai-lab
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+
+  # ---------------------------------------------------------------- ollama --
+  # Only starts with: --profile ollama-container
+  # On Windows with GTX 970s, prefer the native Windows installer instead.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai-lab-ollama
+    profiles: ["ollama-container"]
+    <<: [*restart, *logging]
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      # Pin to the idle GPU. Your display card is 0, compute card is 1.
+      CUDA_VISIBLE_DEVICES: "${OLLAMA_GPU:-1}"
+      OLLAMA_KEEP_ALIVE: "5m"
+      OLLAMA_NUM_PARALLEL: "1"
+      # Maxwell has no flash attention; leave this off.
+      OLLAMA_FLASH_ATTENTION: "0"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${OLLAMA_GPU:-1}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ------------------------------------------------------------ open-webui --
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: ai-lab-webui
+    <<: [*restart, *logging]
+    ports:
+      - "${WEBUI_PORT:-3000}:8080"
+    volumes:
+      - webui-data:/app/backend/data
+    environment:
+      # host.docker.internal reaches native Ollama on the Windows host.
+      # If using --profile ollama-container, set this to http://ollama:11434
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
+      WEBUI_AUTH: "${WEBUI_AUTH:-true}"
+      WEBUI_SECRET_KEY: "${WEBUI_SECRET_KEY:?set WEBUI_SECRET_KEY in .env}"
+      ENABLE_RAG_WEB_SEARCH: "false"
+      # Point Open WebUI's own RAG at Qdrant rather than its bundled store
+      VECTOR_DB: "qdrant"
+      QDRANT_URI: "http://qdrant:6333"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      qdrant:
+        condition: service_started
+
+  # ---------------------------------------------------------------- qdrant --
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: ai-lab-qdrant
+    <<: [*restart, *logging]
+    ports:
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY:-}"
+      QDRANT__TELEMETRY_DISABLED: "true"
+      QDRANT__LOG_LEVEL: "INFO"
+
+  # -------------------------------------------------------------- postgres --
+  # Backing store for Langfuse. Not exposed to the host by default.
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-lab-postgres
+    <<: [*restart, *logging]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-langfuse}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+      POSTGRES_DB: "${POSTGRES_DB:-langfuse}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-langfuse}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # -------------------------------------------------------------- langfuse --
+  # v2 is used deliberately: v3 additionally requires ClickHouse, Redis and
+  # MinIO, which is a lot of moving parts for a single-node lab.
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: ai-lab-langfuse
+    <<: [*restart, *logging]
+    ports:
+      - "${LANGFUSE_PORT:-3001}:3000"
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-langfuse}"
+      NEXTAUTH_URL: "http://localhost:${LANGFUSE_PORT:-3001}"
+      NEXTAUTH_SECRET: "${LANGFUSE_NEXTAUTH_SECRET:?set LANGFUSE_NEXTAUTH_SECRET in .env}"
+      SALT: "${LANGFUSE_SALT:?set LANGFUSE_SALT in .env}"
+      ENCRYPTION_KEY: "${LANGFUSE_ENCRYPTION_KEY:?set LANGFUSE_ENCRYPTION_KEY in .env}"
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "true"
+      # Set to false after you have created your account
+      AUTH_DISABLE_SIGNUP: "${LANGFUSE_DISABLE_SIGNUP:-false}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ------------------------------------------------------------- pgvector ---
+  # Optional alternative to Qdrant. Only starts with: --profile pgvector
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: ai-lab-pgvector
+    profiles: ["pgvector"]
+    <<: [*restart, *logging]
+    ports:
+      - "${PGVECTOR_PORT:-5433}:5432"
+    volumes:
+      - pgvector-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: "${PGVECTOR_USER:-rag}"
+      POSTGRES_PASSWORD: "${PGVECTOR_PASSWORD:-rag}"
+      POSTGRES_DB: "${PGVECTOR_DB:-rag}"
+
+  # ----------------------------------------------------------- gpu metrics --
+  # Wraps nvidia-smi. Chosen over dcgm-exporter because DCGM does not support
+  # Maxwell consumer cards and does not work under WSL2.
+  gpu-exporter:
+    image: utkuozdemir/nvidia_gpu_exporter:1.2.0
+    container_name: ai-lab-gpu-exporter
+    profiles: ["metrics"]
+    <<: [*restart, *logging]
+    ports:
+      - "${GPU_EXPORTER_PORT:-9835}:9835"
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl
+    environment:
+      LD_LIBRARY_PATH: "/usr/lib/wsl/lib"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+
+  # ------------------------------------------------------------ prometheus --
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ai-lab-prometheus
+    profiles: ["metrics"]
+    <<: [*restart, *logging]
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # --------------------------------------------------------------- grafana --
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ai-lab-grafana
+    profiles: ["metrics"]
+    <<: [*restart, *logging]
+    ports:
+      - "${GRAFANA_PORT:-3002}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_INSTALL_PLUGINS: ""
+    depends_on:
+      - prometheus
+
+volumes:
+  ollama-models:
+  webui-data:
+  qdrant-data:
+  postgres-data:
+  pgvector-data:
+  prometheus-data:
+  grafana-data:

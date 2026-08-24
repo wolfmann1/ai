@@ -1,0 +1,38 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    lab: ai-lab
+    host: x99-ws
+
+scrape_configs:
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # GPU metrics via nvidia-smi wrapper.
+  # Key series: nvidia_smi_memory_used_bytes, nvidia_smi_utilization_gpu_ratio,
+  # nvidia_smi_temperature_gpu, nvidia_smi_power_draw_watts
+  - job_name: gpu
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["gpu-exporter:9835"]
+        labels:
+          machine: workstation
+
+  # Qdrant exposes Prometheus metrics at /metrics by default.
+  - job_name: qdrant
+    static_configs:
+      - targets: ["qdrant:6333"]
+
+  # Native Ollama on the Windows host does not expose /metrics.
+  # Uncomment if you later front it with a proxy that does.
+  # - job_name: ollama
+  #   static_configs:
+  #     - targets: ["host.docker.internal:11434"]
+
+  # Uncomment if you add cAdvisor or node-exporter later.
+  # - job_name: cadvisor
+  #   static_configs:
+  #     - targets: ["cadvisor:8080"]
